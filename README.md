@@ -30,5 +30,5 @@ This tool addresses the following project objectives:
 
 Clone the repository:
 ```bash
-git clone https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git
-cd YOUR_REPO_NAME# scRNA_CNA_detection
+git clone https://github.com/RuihanYuan/scRNA_CNA_detection.git
+cd scRNA_CNA_detection

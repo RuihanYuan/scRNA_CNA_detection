@@ -1,0 +1,134 @@
+infer.py
+import os
+from .clustering import easy_cluster
+from .comparison import cluster_compare, genome_abnormal_events_for_clusters
+from cnatool.cna_call import call_cna_by_region
+import pandas as pd
+import scanpy as sc
+
+DEFAULT_REFERENCEDIR = r"D:\bme graduate\EN.580.447\Project Package\cnatool\reference"
+DEFAULT_CLUSTERED = os.path.join(DEFAULT_REFERENCEDIR, "reference_clustered.h5ad")
+DEFAULT_UNCLUSTERED = os.path.join(DEFAULT_REFERENCEDIR, "reference.h5ad")
+
+def ensure_clustered_reference(clustered_path, unclustered_path, cluster_label="cluster"):
+if os.path.exists(clustered_path):
+# already done, nothing to do!
+return clustered_path
+elif os.path.exists(unclustered_path):
+print(f"{clustered_path} not found, generating from {unclustered_path}...")
+from .clustering import cluster_and_save_reference
+adata_ref = sc.read_h5ad(unclustered_path)
+adata_ref.var_names_make_unique()
+adata_ref.obs_names_make_unique()
+cluster_and_save_reference(adata_ref, out_file=clustered_path, cluster_label=cluster_label)
+return clustered_path
+else:
+raise FileNotFoundError(
+f"Neither clustered ({clustered_path}) nor unclustered ({unclustered_path}) reference found."
+)
+
+def infer_cna(
+adata,
+adata_ref=None,
+ref_clustered_file=None,
+cluster_label="cluster",
+overlap_threshold=0.5,
+min_cells=10,
+size_correction_weight=0.5,
+dispersion_ratio_threshold=2.0,
+verbose=True
+):
+adata.var_names_make_unique()
+adata.obs_names_make_unique()
+
+# Load or prepare reference
+if adata_ref is None and ref_clustered_file is None:
+    default_ref_path = ensure_clustered_reference(DEFAULT_CLUSTERED, DEFAULT_UNCLUSTERED, cluster_label)
+    if verbose:
+        print(f"No adata_ref/ref_clustered_file supplied, using default reference: {default_ref_path}")
+    from .io import load_clustered_reference
+    adata_ref_clust = load_clustered_reference(default_ref_path, cluster_label)
+elif adata_ref is not None:
+    if cluster_label in adata_ref.obs.columns:
+        adata_ref_clust = adata_ref
+    else:
+        adata_ref_clust = easy_cluster(adata_ref, cluster_label=cluster_label)
+elif ref_clustered_file is not None:
+    from .io import load_clustered_reference
+    adata_ref_clust = load_clustered_reference(ref_clustered_file, cluster_label)
+else:
+    raise ValueError("Provide adata_ref or ref_clustered_file.")
+
+# Cluster query if needed
+adata_query_clust = easy_cluster(adata, cluster_label=cluster_label)
+
+# (Optional: Call region-wise CNA using gene mapping, if available)
+# This step runs your region-based call if .var['chromosome'] exists
+if 'chromosome' in adata.var.columns:
+    print("Calling CNAs by region...")
+    call_cna_by_region(adata_query_clust, reference_cells=None)  # Ref mask can be supplied if needed
+
+# Compare clusters and flag abnormal groups
+disclusters, reasons = cluster_compare(
+    adata_ref_clust,
+    adata_query_clust,
+    cluster_label,
+    cluster_label,
+    overlap_threshold=overlap_threshold,
+    min_cells=min_cells,
+    size_correction_weight=size_correction_weight,
+    dispersion_ratio_threshold=dispersion_ratio_threshold,
+    verbose=verbose
+)
+if disclusters:
+    if verbose:
+        for cl, reason in zip(disclusters, reasons):
+            print(f"Flagged cluster {cl[0]}: {reason}")
+    # Instead of (or in addition to) genome_check_for_clusters:
+    genome_abnormal_events_for_clusters(
+        adata_query_clust,
+        adata_ref_clust,
+        disclusters,
+        cluster_label=cluster_label,
+        region_col="chromosome", # or whatever region column you want
+        cell_cutoff=3,
+        fold_change_thresh=1.5   # can adjust as needed
+    )
+else:
+    print("No abnormal clusters found at given thresholds.")
+
+# Generate per-cluster CNA summary if region calling was performed
+if 'cna_calls' in adata_query_clust.uns:
+    cna_calls = adata_query_clust.uns['cna_calls']
+    # Step 1: Melt to long-form (region call per cell)
+    calls_long = (cna_calls
+                .reset_index()
+                .melt(id_vars='index', var_name='region', value_name='call')
+                .rename(columns={'index': 'cell'}))
+
+    # Step 2: Add cluster label for each cell
+    calls_long['cluster'] = calls_long['cell'].map(adata_query_clust.obs[cluster_label].to_dict())
+    
+    # Step 3: Group by cluster and region, count events
+    summary = (calls_long
+            .groupby(['cluster', 'region', 'call'])
+            .size()
+            .unstack(fill_value=0)
+            .reset_index())
+    
+    # Step 4: Join with .var for region info
+    gene_annot = adata_query_clust.var.reset_index().rename(columns={'index': 'region'})
+    summary = summary.merge(
+        gene_annot[['region', 'chromosome', 'start', 'end', 'strand']],
+        on='region',
+        how='left'
+    )
+
+    # Reorder columns if desired
+    col_order = ['cluster', 'region', 'chromosome', 'start', 'end', 'strand'] + [c for c in summary.columns if c in {'gain', 'loss', 'neutral'}]
+    summary = summary[[c for c in col_order if c in summary.columns]]
+
+    adata_query_clust.uns['cna_summary'] = summary
+    return disclusters, summary
+else:
+    return disclusters

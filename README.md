@@ -1,101 +1,194 @@
-# CNA Inferencer for scRNA-seq Data
+# cnatool
 
-This Python package provides a method to infer **Copy Number Alterations (CNAs)** from single-cell RNA-sequencing (scRNA-seq) data. CNAs are identified as genomic gains or losses and assigned to individual cells or cell groups using a transparent sliding-window approach. The tool is designed to work with `AnnData` objects and outputs structured CNA annotations for visualization and downstream analysis.
+A lightweight Python package for inferring copy-number alterations (CNAs) from single-cell RNA-seq (scRNA-seq) data via a clustering-driven workflow.
 
 ---
 
-## Project Tasks
+## Table of Contents
 
-This tool addresses the following project objectives:
+1. [Overview](#overview)  
+2. [Installation](#installation)  
+3. [Data Preparation](#data-preparation)  
+4. [Quick Start / Usage](#quick-start--usage)  
+5. [API Reference](#api-reference)  
+6. [Simulation / Gold-standard generation](#simulation--gold-standard-generation)  
+7. [Benchmarking](#benchmarking)  
+8. [Project Structure](#project-structure)  
 
-### Task 1: CNA Inference
+---
 
-* **Input**: an `AnnData` object containing:
+## Overview
 
-  * Raw expression counts in `adata.layers["counts"]`.
-  * Gene genomic coordinates in `adata.var["chromosome"]`, `adata.var["start"]`, `adata.var["end"]`.
-  * Genotype labels in `adata.obs["simulated_cnvs"]`.
-* **Output**: CNA calls as a pandas DataFrame (and stored in `adata.uns["cna_calls"]`) with columns:
+`cnatool` implements a three-step pipeline to detect CNAs from scRNA-seq:
 
-  * `chrom`: chromosome of the event
-  * `start`, `end`: genomic coordinates (basepairs)
-  * `type`: "gain" or "loss"
-  * `cells`: list of cell barcodes harboring the event
-  * `obs_label`: genotype group for which the call was made
-* **API**:
+1. **Clustering**: cluster reference (“diploid”) and query cells separately.  
+2. **Cluster comparison**: flag clusters whose transcriptional dispersion or cell-overlap deviates beyond thresholds.  
+3. **Per-cluster CNA calling**: for each flagged cluster, compute gene-level log₂-fold-change vs reference, smooth along the genome by sliding window, then call gains/losses.
 
-  ```python
-  from mycnatool.infer import infer_all_cnas
-  import scanpy as sc
-
-  adata = sc.read_h5ad("PBMC_simulated_cnas_041025.h5ad")
-  cna_calls = infer_all_cnas(
-      adata,
-      window_size=5,
-      threshold=0.2
-  )
-  adata.uns['cna_calls'] = cna_calls.to_dict('records')
-  ```
-* **Workflow Overview**:
-
-  1. **Reference detection**: identifies the most frequent genotype as the diploid baseline
-  2. **Log₂‐fold-change**: computes per‐gene fold‐changes vs. that baseline (with +1 pseudocount)
-  3. **Genome ordering**: builds and sorts a table of gene positions + mean log₂FC
-  4. **Sliding-window smoothing**: applies a moving average across adjacent genes to reduce noise
-  5. **Threshold & segmentation**: finds contiguous windows above/below threshold, merges them into CNA regions
-  6. **Cell assignment**: records which cells cross threshold within each region
-* **Visualization**: extract the inferred regions from `adata.uns['cna_calls']`, subset the AnnData to overlapping genes, and use the built-in heatmap utilities to plot log₂FC grouped by genotype.
-* **Novelty**: a pure-Python, transparent method requiring only `scanpy`, `numpy`, and `pandas`; no external HMM or PCA dependencies; and automatic reference selection.
-
-### Task 2: Performance Assessment
-
-* Evaluate method accuracy on test datasets using precision, recall, and AUC metrics.
-* Explore the effect of read depth via downsampling.
-
-### Task 3: Application to PSC scRNA-seq
-
-* Apply CNA inference to selected pluripotent stem cell (PSC) datasets to detect known and novel CNAs.
-
-### Optional (Extra Credit)
-
-* Simulate gold-standard data for benchmarking (Task 2B).
-* Predict downstream functional impacts of CNAs on PSCs.
+By focusing only on “abnormal” clusters, the method reduces noise and computational cost while retaining sensitivity to subclonal events.
 
 ---
 
 ## Installation
 
-Clone the repository and install in editable mode:
-
 ```bash
-git clone https://github.com/RuihanYuan/scRNA_CNA_detection.git
-cd scRNA_CNA_detection
+# Clone the repo
+git clone https://github.com/yourusername/cnatool.git
+cd cnatool
+
+# Create & activate environment
+conda create -n cnatool-env python=3.10 -y
+conda activate cnatool-env
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Install package in editable mode
 pip install -e .
 ```
 
-Dependencies:
+---
 
-* Python 3.8+
-* `scanpy`
-* `numpy`
-* `pandas`
+## Dependencies
+
+The following Python packages are required:
+	•	scanpy
+	•	numpy
+	•	pandas
+	•	scipy
+	•	scikit-learn
+	•	leidenalg
 
 ---
 
-## Usage Example
+## Data Preparation
 
-```python
+Before running CNA inference, your AnnData must include genomic coordinates in .var:
+
+```bash
 import scanpy as sc
-from mycnatool.infer import infer_all_cnas
+from cnatool.io import annotate_with_coords
 
-adata = sc.read_h5ad("PBMC_simulated_cnas_041025.h5ad")
-cna_calls = infer_all_cnas(adata, window_size=5, threshold=0.2)
-adata.uns['cna_calls'] = cna_calls.to_dict('records')
-print(cna_calls)
+adata = sc.read_10x_h5("filtered_feature_bc_matrix.h5")
+adata.var_names_make_unique()
+
+# Annotate with Ensembl Biomart
+adata = annotate_with_coords(
+    adata,
+    gene_id_col="gene_symbol",
+    host="http://www.ensembl.org",
+    dataset="hsapiens_gene_ensembl"
+)
+
+adata.write_h5ad("GSE243112_with_coords.h5ad")
 ```
 
+That yields .var columns:
+
+```bash
+ensembl_gene_id | chromosome | start | end | strand
+```
+
+## Quick start:
+
+```bash
+import scanpy as sc
+from cnatool.infer import infer_cna
+
+# 1) Load your query data
+adata_query = sc.read_h5ad("GSE243112_with_coords.h5ad")
+
+# 2) (Optional) Provide your own diploid reference
+# adata_ref = sc.read_h5ad("healthy_reference_with_coords.h5ad")
+
+# 3) Run CNA inference
+dclusters, summary_df = infer_cna(
+    adata=adata_query,
+    adata_ref=None,              # or adata_ref
+    overlap_threshold=0.5,
+    min_cells=10,
+    dispersion_ratio_threshold=2.0,
+    min_genes=5,
+    z_threshold=1.0,
+    verbose=True
+)
+
+# 4) Inspect results
+print("Flagged clusters:", dclusters)
+print(summary_df.head())
+```
+Results are saved in adata_query.uns['cna_summary'], a DataFrame with:
+
+```
+cluster | region | chromosome | start | end | strand | gain | loss | neutral
+```
 ---
+## API Reference
 
-## License
+- **`infer_cna(...)`**  
+  Detect abnormal clusters and call CNAs. Returns `(dclusters, summary_df)`.
 
-MIT License
+- **`call_cna_by_region(...)`**  
+  Binned, z-score CNA caller. Builds region bins if missing.
+
+- **`add_genome_bins(var_df, bin_size)`**  
+  Assigns genes to fixed-size genomic bins (`region`, `bin_start`, `bin_end`).
+
+- **`easy_cluster(adata, ...)`**  
+  Filter → normalize → log1p → PCA → KNN → Leiden clustering.
+---
+## Simulation / Gold-standard generation
+
+Generate synthetic CNAs of arbitrary size/frequency:
+
+```
+from cnatool.simulation import simulate_gold_standard_cnas
+
+regions      = ["1:1e7-2e7", "6:2.5e7-3.5e7", "X:0-1.55e8"]
+frequencies  = [0.10, 0.15, 0.05]
+copy_numbers = [0, 1, 4]
+
+adata_gold = simulate_gold_standard_cnas(
+    adata_query,
+    regions,
+    frequencies,
+    copy_numbers,
+    layer="counts"
+)
+
+# 'adata_gold.obs["gold_cna"]' now holds ground-truth labels per cell
+```
+
+## Benchmarking
+
+See task2_gold_standard.ipynb for a full walk-through:
+	1.	Flatten predictions (adata_query.uns['cna_summary']) and truth (adata_gold.obs['gold_cna']).
+	2.	Compute precision, recall, F1 per region.
+	3.	Sweep parameters (e.g. overlap_threshold, z_threshold) and display an F1 heatmap.
+
+Launch it with:
+```
+jupyter notebook task2_gold_standard.ipynb
+```
+
+## Project Structure
+```
+Project Package/
+├── cnatool/
+│   ├── __init__.py
+│   ├── io.py
+│   ├── infer.py
+│   ├── cna_call.py
+│   ├── clustering.py
+│   ├── comparison.py
+│   ├── simulation.py
+│   └── reference/         # default reference .h5ad files
+├── GSE243112_with_coords.h5ad
+├── PBMC_simulated_cnas_041025.h5ad
+├── PBMC_gold_standard.h5ad
+├── task2_gold_standard.ipynb
+├── Project Run.ipynb
+├── test.ipynb
+├── requirements.txt
+└── README.md
+```

@@ -33,7 +33,7 @@ By focusing only on “abnormal” clusters, the method reduces noise and comput
 
 ```bash
 # Clone the repo
-git clone https://github.com/yourusername/cnatool.git
+git clone https://github.com/RuihanYuan/cnatool.git
 cd cnatool
 
 # Create & activate environment
